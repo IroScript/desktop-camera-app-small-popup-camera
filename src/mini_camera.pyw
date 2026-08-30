@@ -1,14 +1,15 @@
 """
-Ultra-Responsive Mini Floating Camera Widget with Auto-Record
+Ultra-Responsive Mini Floating Camera Widget with Auto-Record & Global F4 Hotkey
 Author: Antigravity Assistant for Irak Bhai
 Features:
 - Auto Video Recording starts immediately upon opening!
+- Global F4 Hotkey & Socket IPC daemon on port 59123
 - Single-instance lock (prevents duplicate processes fighting for webcam)
 - Dedicated background camera thread (zero UI lag, buttery smooth 30fps)
 - Always-On-Top (~1.2 inch square floating widget)
 - Drag & Drop anywhere on screen
 - 1-Click Video Recording + Photo Capture
-- Instant close button (✖) with safe video finalize & save
+- Instant close button (✖) / F4 key with safe video finalize & save
 """
 
 import os
@@ -17,26 +18,30 @@ import time
 import socket
 import datetime
 import threading
+import subprocess
 import tkinter as tk
 import cv2
 from PIL import Image, ImageTk
+import ctypes
+from ctypes import wintypes
 
-# Enforce single instance via socket lock
-LOCK_SOCKET = None
-def acquire_single_instance_lock(port=59123):
-    global LOCK_SOCKET
-    try:
-        LOCK_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        LOCK_SOCKET.bind(('127.0.0.1', port))
-        LOCK_SOCKET.listen(1)
-        return True
-    except socket.error:
-        return False
+HOTKEY_SERVICE_PORT = 59122
+MINI_CAMERA_PORT = 59123
+
+VK_F4 = 0x73
+HOTKEY_ID = 102
+MOD_NOREPEAT = 0x4000
+WM_HOTKEY = 0x0312
+WM_QUIT = 0x0012
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 
 PHOTO_DIR = os.path.expanduser(r"~\Pictures\Camera Roll")
 VIDEO_DIR = os.path.expanduser(r"~\Videos")
 os.makedirs(PHOTO_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
+
 
 class CameraWorker(threading.Thread):
     """Dedicated background thread to read webcam frames without blocking GUI"""
@@ -140,7 +145,10 @@ class MiniCameraApp:
     def __init__(self, root, auto_record=True):
         self.root = root
         self.root.title("Mini Camera")
-        
+        self.running = True
+        self.hotkey_registered = False
+        self.server_socket = None
+
         # Dimensions: 170x170 px square
         self.size = 170
         self.root.geometry(f"{self.size}x{self.size}+{self.root.winfo_screenwidth() - self.size - 30}+50")
@@ -162,6 +170,8 @@ class MiniCameraApp:
 
         self._build_ui()
         self._setup_events()
+        self._start_ipc_server()
+        self._setup_local_hotkey()
         self._render_loop()
 
     def _build_ui(self):
@@ -233,6 +243,7 @@ class MiniCameraApp:
         self.menu.add_command(label="🔴 Start / Stop Recording", command=self.toggle_rec)
         self.menu.add_command(label="📸 Take Photo", command=self.take_snap)
         self.menu.add_separator()
+        self.menu.add_command(label="⌨ Hotkey: [F4] Toggle / Close", state="disabled")
         self.menu.add_command(label="🪞 Toggle Mirror Mode", command=self.toggle_mirror)
         self.menu.add_command(label="🔄 Resize: Small (150px)", command=lambda: self.resize_window(150))
         self.menu.add_command(label="🔄 Resize: Medium (220px)", command=lambda: self.resize_window(220))
@@ -241,7 +252,7 @@ class MiniCameraApp:
         self.menu.add_command(label="📂 Open Videos Folder", command=lambda: os.startfile(VIDEO_DIR))
         self.menu.add_command(label="📂 Open Photos Folder", command=lambda: os.startfile(PHOTO_DIR))
         self.menu.add_separator()
-        self.menu.add_command(label="✖ Exit Mini Camera", command=self.close_app)
+        self.menu.add_command(label="✖ Exit Mini Camera (F4)", command=self.close_app)
 
     def _setup_events(self):
         # Dragging
@@ -252,6 +263,66 @@ class MiniCameraApp:
 
         # Double click video to toggle recording
         self.canvas_lbl.bind("<Double-Button-1>", lambda e: self.toggle_rec())
+
+        # Keyboard shortcuts
+        self.root.bind("<F4>", lambda e: self.close_app())
+        self.root.bind("<Escape>", lambda e: self.close_app())
+
+    def _start_ipc_server(self):
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('127.0.0.1', MINI_CAMERA_PORT))
+            self.server_socket.listen(5)
+        except socket.error:
+            # Socket already bound, let main handle it
+            return
+
+        def _ipc_loop():
+            while self.running:
+                try:
+                    self.server_socket.settimeout(1.0)
+                    conn, _ = self.server_socket.accept()
+                    cmd = conn.recv(1024).decode('utf-8', errors='ignore').strip()
+                    if cmd == 'PING':
+                        conn.sendall(b'PONG\n')
+                    elif cmd in ('TOGGLE', 'CLOSE', 'STOP'):
+                        conn.sendall(b'CLOSING\n')
+                        conn.close()
+                        self.root.after(0, self.close_app)
+                        break
+                    elif cmd == 'SHOW':
+                        conn.sendall(b'SHOWN\n')
+                        self.root.after(0, lambda: (
+                            self.root.deiconify(),
+                            self.root.lift(),
+                            self.root.attributes("-topmost", True)
+                        ))
+                    conn.close()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+
+        threading.Thread(target=_ipc_loop, daemon=True).start()
+
+    def _setup_local_hotkey(self):
+        """Hardware polling and hotkey listener for F4"""
+        def _poll_f4():
+            prev_f4 = False
+            while self.running:
+                try:
+                    f4_down = bool(user32.GetAsyncKeyState(VK_F4) & 0x8000)
+                    alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+                    if f4_down and not prev_f4 and not alt_down:
+                        self.root.after(0, self.close_app)
+                        break
+                    prev_f4 = f4_down
+                except Exception:
+                    pass
+                time.sleep(0.02)
+
+        threading.Thread(target=_poll_f4, daemon=True).start()
 
     def _drag_start(self, event):
         self.drag_x = event.x_root - self.root.winfo_x()
@@ -289,6 +360,8 @@ class MiniCameraApp:
         self.root.geometry(f"{self.size}x{self.size}+{x}+{y}")
 
     def _render_loop(self):
+        if not self.running:
+            return
         frame = self.worker.get_frame()
         if frame is not None:
             # Auto start recording once first live frame arrives
@@ -322,14 +395,51 @@ class MiniCameraApp:
         self.root.after(30, self._render_loop)
 
     def close_app(self):
+        if not self.running:
+            return
+        self.running = False
+        if self.hotkey_registered:
+            try:
+                user32.UnregisterHotKey(None, HOTKEY_ID)
+            except Exception:
+                pass
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
         self.worker.stop()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
         sys.exit(0)
 
 
+def send_toggle_to_running_instance():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        s.connect(('127.0.0.1', MINI_CAMERA_PORT))
+        s.sendall(b'TOGGLE\n')
+        s.recv(1024)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
 if __name__ == "__main__":
-    if not acquire_single_instance_lock():
-        sys.exit(0) # Already running, avoid duplicate instance
+    # Test if another instance is already running
+    try:
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        test_sock.bind(('127.0.0.1', MINI_CAMERA_PORT))
+        test_sock.close()
+    except socket.error:
+        # Already running, toggle and exit
+        send_toggle_to_running_instance()
+        sys.exit(0)
 
     root = tk.Tk()
     app = MiniCameraApp(root, auto_record=True)
