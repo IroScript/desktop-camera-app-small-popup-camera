@@ -1,15 +1,14 @@
 """
-Ultra-Responsive Mini Floating Camera Widget with Auto-Record & Global F4 Hotkey
+Ultra-Responsive Mini Floating Camera Widget (Half-Inch Square, Top-Middle Attached, Zoom In/Out)
 Author: Antigravity Assistant for Irak Bhai
+
 Features:
-- Auto Video Recording starts immediately upon opening!
-- Global F4 Hotkey & Socket IPC daemon on port 59123
-- Single-instance lock (prevents duplicate processes fighting for webcam)
-- Dedicated background camera thread (zero UI lag, buttery smooth 30fps)
-- Always-On-Top (~1.2 inch square floating widget)
-- Drag & Drop anywhere on screen
-- 1-Click Video Recording + Photo Capture
-- Instant close button (✖) / F4 key with safe video finalize & save
+- Half-inch square initial size (~70x70px), attached to top-middle of screen directly below webcam
+- Interactive Zoom In / Zoom Out via [+] / [=] and [-] / [_] keys, mouse scroll, or on-screen buttons
+- Auto Video Recording starts immediately upon opening
+- Always-On-Top floating widget with drag & drop
+- 1-Click Snapshot (📸) + Video Recording Toggle (🔴)
+- Global F4 Hotkey + IPC daemon on port 59123
 """
 
 import os
@@ -41,6 +40,11 @@ PHOTO_DIR = os.path.expanduser(r"~\Pictures\Camera Roll")
 VIDEO_DIR = os.path.expanduser(r"~\Videos")
 os.makedirs(PHOTO_DIR, exist_ok=True)
 os.makedirs(VIDEO_DIR, exist_ok=True)
+
+# Size boundaries
+MIN_SIZE = 65    # Half-inch square (~0.5 inch)
+MAX_SIZE = 450   # Maximum zoom
+ZOOM_STEP = 25   # Step size per zoom in / out
 
 
 class CameraWorker(threading.Thread):
@@ -149,9 +153,14 @@ class MiniCameraApp:
         self.hotkey_registered = False
         self.server_socket = None
 
-        # Dimensions: 170x170 px square
-        self.size = 170
-        self.root.geometry(f"{self.size}x{self.size}+{self.root.winfo_screenwidth() - self.size - 30}+50")
+        # Start with half-inch square size (~70px)
+        self.size = 70
+        screen_w = self.root.winfo_screenwidth()
+        # Position directly at top-center (below webcam lens)
+        init_x = (screen_w - self.size) // 2
+        init_y = 0
+
+        self.root.geometry(f"{self.size}x{self.size}+{init_x}+{init_y}")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.configure(bg="#11111b")
@@ -167,11 +176,19 @@ class MiniCameraApp:
         # UI Drag state
         self.drag_x = 0
         self.drag_y = 0
+        self.hovered = False
 
         self._build_ui()
         self._setup_events()
         self._start_ipc_server()
         self._setup_local_hotkey()
+        
+        # Focus so + / = / - / F4 work immediately upon launch
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(100, self.root.focus_force)
+        self.root.after(200, self.canvas_lbl.focus_set)
+
         self._render_loop()
 
     def _build_ui(self):
@@ -180,13 +197,12 @@ class MiniCameraApp:
         self.border_frame.pack(fill="both", expand=True)
 
         # Video Label
-        self.canvas_lbl = tk.Label(self.border_frame, bg="#000000")
+        self.canvas_lbl = tk.Label(self.border_frame, bg="#000000", cursor="hand2")
         self.canvas_lbl.pack(fill="both", expand=True)
 
-        # Control Bar (Top)
-        self.top_bar = tk.Frame(self.border_frame, bg="#181825", height=24)
-        self.top_bar.place(relx=0.0, rely=0.0, relwidth=1.0, height=24)
-
+        # Control Bar for larger sizes (hidden at half-inch, visible at size > 90)
+        self.top_bar = tk.Frame(self.border_frame, bg="#181825", height=22)
+        
         # Record Button
         self.btn_rec = tk.Button(
             self.top_bar,
@@ -197,12 +213,12 @@ class MiniCameraApp:
             activebackground="#eba0ac",
             relief="flat",
             bd=0,
-            padx=4,
+            padx=3,
             pady=0,
             cursor="hand2",
             command=self.toggle_rec
         )
-        self.btn_rec.pack(side="left", padx=3, pady=2)
+        self.btn_rec.pack(side="left", padx=2, pady=1)
 
         # Snap Photo Button
         self.btn_snap = tk.Button(
@@ -214,12 +230,46 @@ class MiniCameraApp:
             activebackground="#b4befe",
             relief="flat",
             bd=0,
-            padx=4,
+            padx=2,
             pady=0,
             cursor="hand2",
             command=self.take_snap
         )
-        self.btn_snap.pack(side="left", padx=2, pady=2)
+        self.btn_snap.pack(side="left", padx=1, pady=1)
+
+        # Zoom Out Button (-)
+        self.btn_zoom_out = tk.Button(
+            self.top_bar,
+            text="➖",
+            font=("Segoe UI", 7, "bold"),
+            bg="#313244",
+            fg="#cdd6f4",
+            activebackground="#45475a",
+            relief="flat",
+            bd=0,
+            padx=3,
+            pady=0,
+            cursor="hand2",
+            command=self.zoom_out
+        )
+        self.btn_zoom_out.pack(side="left", padx=1, pady=1)
+
+        # Zoom In Button (+)
+        self.btn_zoom_in = tk.Button(
+            self.top_bar,
+            text="➕",
+            font=("Segoe UI", 7, "bold"),
+            bg="#313244",
+            fg="#cdd6f4",
+            activebackground="#45475a",
+            relief="flat",
+            bd=0,
+            padx=3,
+            pady=0,
+            cursor="hand2",
+            command=self.zoom_in
+        )
+        self.btn_zoom_in.pack(side="left", padx=1, pady=1)
 
         # Close Button (✖)
         self.btn_close = tk.Button(
@@ -231,42 +281,150 @@ class MiniCameraApp:
             activebackground="#be5046",
             relief="flat",
             bd=0,
-            padx=5,
+            padx=4,
             pady=0,
             cursor="hand2",
             command=self.close_app
         )
-        self.btn_close.pack(side="right", padx=3, pady=2)
+        self.btn_close.pack(side="right", padx=2, pady=1)
+
+        # Mini overlay close button for half-inch mode
+        self.mini_close = tk.Label(
+            self.border_frame,
+            text="✖",
+            font=("Segoe UI", 7, "bold"),
+            bg="#e06c75",
+            fg="#ffffff",
+            cursor="hand2"
+        )
+        self.mini_close.bind("<Button-1>", lambda e: self.close_app())
+
+        # Mini rec indicator for half-inch mode
+        self.mini_rec_dot = tk.Label(
+            self.border_frame,
+            text="●",
+            font=("Segoe UI", 7, "bold"),
+            bg="#000000",
+            fg="#f38ba8"
+        )
 
         # Context Menu (Right Click)
         self.menu = tk.Menu(self.root, tearoff=0, bg="#1e1e2e", fg="#cdd6f4", font=("Segoe UI", 9))
-        self.menu.add_command(label="🔴 Start / Stop Recording", command=self.toggle_rec)
-        self.menu.add_command(label="📸 Take Photo", command=self.take_snap)
+        self.menu.add_command(label="➕ Zoom In (+ or =)", command=self.zoom_in)
+        self.menu.add_command(label="➖ Zoom Out (- or _)", command=self.zoom_out)
         self.menu.add_separator()
-        self.menu.add_command(label="⌨ Hotkey: [F4] Toggle / Close", state="disabled")
+        self.menu.add_command(label="🔄 Half-Inch Square (70px)", command=lambda: self.change_size(70))
+        self.menu.add_command(label="🔄 Small (130px)", command=lambda: self.change_size(130))
+        self.menu.add_command(label="🔄 Medium (200px)", command=lambda: self.change_size(200))
+        self.menu.add_command(label="🔄 Large (300px)", command=lambda: self.change_size(300))
+        self.menu.add_separator()
+        self.menu.add_command(label="🔴 Start / Stop Recording", command=self.toggle_rec)
+        self.menu.add_command(label="📸 Take Photo (Space)", command=self.take_snap)
         self.menu.add_command(label="🪞 Toggle Mirror Mode", command=self.toggle_mirror)
-        self.menu.add_command(label="🔄 Resize: Small (150px)", command=lambda: self.resize_window(150))
-        self.menu.add_command(label="🔄 Resize: Medium (220px)", command=lambda: self.resize_window(220))
-        self.menu.add_command(label="🔄 Resize: Large (300px)", command=lambda: self.resize_window(300))
         self.menu.add_separator()
         self.menu.add_command(label="📂 Open Videos Folder", command=lambda: os.startfile(VIDEO_DIR))
         self.menu.add_command(label="📂 Open Photos Folder", command=lambda: os.startfile(PHOTO_DIR))
         self.menu.add_separator()
-        self.menu.add_command(label="✖ Exit Mini Camera (F4)", command=self.close_app)
+        self.menu.add_command(label="✖ Exit Mini Camera (F4 / Esc)", command=self.close_app)
+
+        self._update_layout()
+
+    def _update_layout(self):
+        """Show full top bar when enlarged, hide when half-inch"""
+        if self.size > 90:
+            self.top_bar.place(relx=0.0, rely=0.0, relwidth=1.0, height=22)
+            self.mini_close.place_forget()
+            self.mini_rec_dot.place_forget()
+        else:
+            self.top_bar.place_forget()
+            if self.hovered:
+                self.mini_close.place(relx=1.0, rely=0.0, anchor="ne", width=14, height=14)
+            else:
+                self.mini_close.place_forget()
+            if self.worker.is_recording:
+                self.mini_rec_dot.place(relx=0.0, rely=0.0, anchor="nw", width=14, height=14)
+            else:
+                self.mini_rec_dot.place_forget()
 
     def _setup_events(self):
-        # Dragging
+        # Dragging & clicking
         for widget in (self.canvas_lbl, self.border_frame, self.top_bar):
-            widget.bind("<Button-1>", self._drag_start)
+            widget.bind("<Button-1>", self._on_mouse_down)
             widget.bind("<B1-Motion>", self._drag_motion)
             widget.bind("<Button-3>", lambda e: self.menu.post(e.x_root, e.y_root))
+            widget.bind("<Enter>", self._on_enter)
+            widget.bind("<Leave>", self._on_leave)
 
         # Double click video to toggle recording
         self.canvas_lbl.bind("<Double-Button-1>", lambda e: self.toggle_rec())
 
-        # Keyboard shortcuts
-        self.root.bind("<F4>", lambda e: self.close_app())
-        self.root.bind("<Escape>", lambda e: self.close_app())
+        # Mouse wheel zoom in / out
+        self.root.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.canvas_lbl.bind("<MouseWheel>", self._on_mouse_wheel)
+
+        # Universal keypress listener for +, =, -, _, F4, Esc, Space
+        self.root.bind("<Key>", self._on_key_press)
+        self.canvas_lbl.bind("<Key>", self._on_key_press)
+
+    def _on_mouse_down(self, event):
+        self.root.focus_force()
+        self.drag_x = event.x_root - self.root.winfo_x()
+        self.drag_y = event.y_root - self.root.winfo_y()
+
+    def _drag_motion(self, event):
+        x = event.x_root - self.drag_x
+        y = event.y_root - self.drag_y
+        self.root.geometry(f"+{x}+{y}")
+
+    def _on_enter(self, event):
+        self.hovered = True
+        self._update_layout()
+
+    def _on_leave(self, event):
+        self.hovered = False
+        self._update_layout()
+
+    def _on_mouse_wheel(self, event):
+        if event.delta > 0:
+            self.zoom_in()
+        else:
+            self.zoom_out()
+
+    def _on_key_press(self, event):
+        k = event.keysym.lower()
+        char = event.char
+        if char in ('+', '=') or k in ('plus', 'equal', 'kp_add'):
+            self.zoom_in()
+        elif char in ('-', '_') or k in ('minus', 'underscore', 'kp_subtract'):
+            self.zoom_out()
+        elif k in ('f4', 'escape', 'q'):
+            self.close_app()
+        elif char == ' ':
+            self.take_snap()
+
+    def zoom_in(self):
+        self.change_size(self.size + ZOOM_STEP)
+
+    def zoom_out(self):
+        self.change_size(self.size - ZOOM_STEP)
+
+    def change_size(self, new_size):
+        new_size = max(MIN_SIZE, min(MAX_SIZE, new_size))
+        if new_size == self.size:
+            return
+
+        old_size = self.size
+        curr_x = self.root.winfo_x()
+        curr_y = self.root.winfo_y()
+
+        # Keep centered horizontally
+        new_x = curr_x - (new_size - old_size) // 2
+        screen_w = self.root.winfo_screenwidth()
+        new_x = max(0, min(screen_w - new_size, new_x))
+
+        self.size = new_size
+        self.root.geometry(f"{self.size}x{self.size}+{new_x}+{curr_y}")
+        self._update_layout()
 
     def _start_ipc_server(self):
         try:
@@ -275,7 +433,6 @@ class MiniCameraApp:
             self.server_socket.bind(('127.0.0.1', MINI_CAMERA_PORT))
             self.server_socket.listen(5)
         except socket.error:
-            # Socket already bound, let main handle it
             return
 
         def _ipc_loop():
@@ -296,8 +453,15 @@ class MiniCameraApp:
                         self.root.after(0, lambda: (
                             self.root.deiconify(),
                             self.root.lift(),
-                            self.root.attributes("-topmost", True)
+                            self.root.attributes("-topmost", True),
+                            self.root.focus_force()
                         ))
+                    elif cmd == 'ZOOM_IN':
+                        conn.sendall(b'OK\n')
+                        self.root.after(0, self.zoom_in)
+                    elif cmd == 'ZOOM_OUT':
+                        conn.sendall(b'OK\n')
+                        self.root.after(0, self.zoom_out)
                     conn.close()
                 except socket.timeout:
                     continue
@@ -307,7 +471,7 @@ class MiniCameraApp:
         threading.Thread(target=_ipc_loop, daemon=True).start()
 
     def _setup_local_hotkey(self):
-        """Hardware polling and hotkey listener for F4"""
+        """Hardware polling for F4 key"""
         def _poll_f4():
             prev_f4 = False
             while self.running:
@@ -324,24 +488,18 @@ class MiniCameraApp:
 
         threading.Thread(target=_poll_f4, daemon=True).start()
 
-    def _drag_start(self, event):
-        self.drag_x = event.x_root - self.root.winfo_x()
-        self.drag_y = event.y_root - self.root.winfo_y()
-
-    def _drag_motion(self, event):
-        x = event.x_root - self.drag_x
-        y = event.y_root - self.drag_y
-        self.root.geometry(f"+{x}+{y}")
-
     def toggle_rec(self):
         if not self.worker.is_recording:
             if self.worker.start_record():
                 self.btn_rec.config(text="⏹ STOP", bg="#a6e3a1")
                 self.border_frame.config(bg="#f38ba8")
+                self.mini_rec_dot.config(fg="#f38ba8")
         else:
             self.worker.stop_record()
             self.btn_rec.config(text="🔴 REC", bg="#f38ba8")
             self.border_frame.config(bg="#3b4261")
+            self.mini_rec_dot.config(fg="#585b70")
+        self._update_layout()
 
     def take_snap(self):
         fn = self.worker.snap_photo()
@@ -352,12 +510,6 @@ class MiniCameraApp:
 
     def toggle_mirror(self):
         self.worker.mirror = not self.worker.mirror
-
-    def resize_window(self, new_size):
-        self.size = new_size
-        x = self.root.winfo_x()
-        y = self.root.winfo_y()
-        self.root.geometry(f"{self.size}x{self.size}+{x}+{y}")
 
     def _render_loop(self):
         if not self.running:
@@ -376,8 +528,9 @@ class MiniCameraApp:
             cy = (h - min_dim) // 2
             square = frame[cy:cy+min_dim, cx:cx+min_dim]
 
-            # Resize to fit window below top bar
-            render_size = max(self.size - 6, 80)
+            # Fit render size based on current window size and top bar
+            top_offset = 24 if self.size > 90 else 4
+            render_size = max(self.size - top_offset, 40)
             resized = cv2.resize(square, (render_size, render_size), interpolation=cv2.INTER_AREA)
             rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
@@ -387,7 +540,7 @@ class MiniCameraApp:
             self.canvas_lbl.configure(image=imgtk)
 
         # Update record button text with duration if recording
-        if self.worker.is_recording:
+        if self.worker.is_recording and self.size > 90:
             elapsed = int(time.time() - self.worker.record_start_time)
             m, s = divmod(elapsed, 60)
             self.btn_rec.config(text=f"⏹ {m:02d}:{s:02d}")
@@ -398,11 +551,6 @@ class MiniCameraApp:
         if not self.running:
             return
         self.running = False
-        if self.hotkey_registered:
-            try:
-                user32.UnregisterHotKey(None, HOTKEY_ID)
-            except Exception:
-                pass
         if self.server_socket:
             try:
                 self.server_socket.close()
