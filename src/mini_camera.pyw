@@ -1,10 +1,11 @@
 """
-Ultra-Responsive Mini Floating Camera Widget (Half-Inch Square, Top-Middle Attached, Zoom In/Out)
+Ultra-Responsive Mini Floating Camera Widget (Half-Inch Square, Top-Middle Attached, Instant Hardware Zoom In/Out)
 Author: Antigravity Assistant for Irak Bhai
 
 Features:
 - Half-inch square initial size (~70x70px), attached to top-middle of screen directly below webcam
-- Interactive Zoom In / Zoom Out via [+] / [=] and [-] / [_] keys, mouse scroll, or on-screen buttons
+- Instant Hardware Zoom In / Zoom Out via [+] / [=] and [-] / [_] without requiring mouse click
+- Force foreground focus on launch
 - Auto Video Recording starts immediately upon opening
 - Always-On-Top floating widget with drag & drop
 - 1-Click Snapshot (📸) + Video Recording Toggle (🔴)
@@ -27,7 +28,14 @@ from ctypes import wintypes
 HOTKEY_SERVICE_PORT = 59122
 MINI_CAMERA_PORT = 59123
 
-VK_F4 = 0x73
+# Windows Virtual Key Codes
+VK_F4 = 0x73          # F4
+VK_ESCAPE = 0x1B      # Esc
+VK_OEM_PLUS = 0xBB    # [+] / [=] key
+VK_OEM_MINUS = 0xBD   # [-] / [_] key
+VK_ADD = 0x6B         # Numpad [+]
+VK_SUBTRACT = 0x6D    # Numpad [-]
+VK_MENU = 0x12        # Alt key
 HOTKEY_ID = 102
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
@@ -45,6 +53,38 @@ os.makedirs(VIDEO_DIR, exist_ok=True)
 MIN_SIZE = 65    # Half-inch square (~0.5 inch)
 MAX_SIZE = 450   # Maximum zoom
 ZOOM_STEP = 25   # Step size per zoom in / out
+
+
+def force_window_focus(root):
+    """Force OS-level foreground focus to borderless Tkinter window"""
+    try:
+        root.update_idletasks()
+        hwnd = root.winfo_id()
+        parent = user32.GetParent(hwnd)
+        if parent:
+            hwnd = parent
+        
+        fg_hwnd = user32.GetForegroundWindow()
+        fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None)
+        cur_thread = kernel32.GetCurrentThreadId()
+        
+        if fg_thread != cur_thread and fg_thread != 0:
+            user32.AttachThreadInput(fg_thread, cur_thread, True)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetFocus(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+            user32.AttachThreadInput(fg_thread, cur_thread, False)
+        else:
+            user32.SetForegroundWindow(hwnd)
+            user32.SetFocus(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.BringWindowToTop(hwnd)
+    except Exception:
+        pass
+    root.lift()
+    root.attributes("-topmost", True)
+    root.focus_force()
 
 
 class CameraWorker(threading.Thread):
@@ -173,21 +213,20 @@ class MiniCameraApp:
         self.worker = CameraWorker()
         self.worker.start()
 
-        # UI Drag state
+        # UI Drag & Zoom state
         self.drag_x = 0
         self.drag_y = 0
         self.hovered = False
+        self.last_hardware_zoom_time = 0
 
         self._build_ui()
         self._setup_events()
         self._start_ipc_server()
-        self._setup_local_hotkey()
+        self._setup_hardware_listener()
         
-        # Focus so + / = / - / F4 work immediately upon launch
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-        self.root.after(100, self.root.focus_force)
-        self.root.after(200, self.canvas_lbl.focus_set)
+        # Force OS-level focus immediately on launch
+        self.root.after(50, lambda: force_window_focus(self.root))
+        self.root.after(150, lambda: self.canvas_lbl.focus_set())
 
         self._render_loop()
 
@@ -362,12 +401,12 @@ class MiniCameraApp:
         self.root.bind("<MouseWheel>", self._on_mouse_wheel)
         self.canvas_lbl.bind("<MouseWheel>", self._on_mouse_wheel)
 
-        # Universal keypress listener for +, =, -, _, F4, Esc, Space
+        # Tkinter keypress listener for +, =, -, _, F4, Esc, Space
         self.root.bind("<Key>", self._on_key_press)
         self.canvas_lbl.bind("<Key>", self._on_key_press)
 
     def _on_mouse_down(self, event):
-        self.root.focus_force()
+        force_window_focus(self.root)
         self.drag_x = event.x_root - self.root.winfo_x()
         self.drag_y = event.y_root - self.root.winfo_y()
 
@@ -452,9 +491,7 @@ class MiniCameraApp:
                         conn.sendall(b'SHOWN\n')
                         self.root.after(0, lambda: (
                             self.root.deiconify(),
-                            self.root.lift(),
-                            self.root.attributes("-topmost", True),
-                            self.root.focus_force()
+                            force_window_focus(self.root)
                         ))
                     elif cmd == 'ZOOM_IN':
                         conn.sendall(b'OK\n')
@@ -470,23 +507,54 @@ class MiniCameraApp:
 
         threading.Thread(target=_ipc_loop, daemon=True).start()
 
-    def _setup_local_hotkey(self):
-        """Hardware polling for F4 key"""
-        def _poll_f4():
+    def _setup_hardware_listener(self):
+        """Dedicated background hardware poller for instant key reaction without mouse click"""
+        def _poll_keys():
             prev_f4 = False
+            prev_esc = False
+            prev_plus = False
+            prev_minus = False
+
             while self.running:
                 try:
+                    now = time.time()
+
+                    # 1. F4 Hardware Check (Close / Toggle)
                     f4_down = bool(user32.GetAsyncKeyState(VK_F4) & 0x8000)
-                    alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+                    alt_down = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
                     if f4_down and not prev_f4 and not alt_down:
                         self.root.after(0, self.close_app)
                         break
                     prev_f4 = f4_down
+
+                    # 2. Escape Hardware Check (Close)
+                    esc_down = bool(user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000)
+                    if esc_down and not prev_esc:
+                        self.root.after(0, self.close_app)
+                        break
+                    prev_esc = esc_down
+
+                    # 3. Zoom In Hardware Check: [+] / [=] key (0xBB) or Numpad [+] (0x6B)
+                    plus_down = bool((user32.GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) or (user32.GetAsyncKeyState(VK_ADD) & 0x8000))
+                    if plus_down:
+                        if not prev_plus or (now - self.last_hardware_zoom_time > 0.14):
+                            self.last_hardware_zoom_time = now
+                            self.root.after(0, self.zoom_in)
+                    prev_plus = plus_down
+
+                    # 4. Zoom Out Hardware Check: [-] / [_] key (0xBD) or Numpad [-] (0x6D)
+                    minus_down = bool((user32.GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) or (user32.GetAsyncKeyState(VK_SUBTRACT) & 0x8000))
+                    if minus_down:
+                        if not prev_minus or (now - self.last_hardware_zoom_time > 0.14):
+                            self.last_hardware_zoom_time = now
+                            self.root.after(0, self.zoom_out)
+                    prev_minus = minus_down
+
                 except Exception:
                     pass
                 time.sleep(0.02)
 
-        threading.Thread(target=_poll_f4, daemon=True).start()
+        threading.Thread(target=_poll_keys, daemon=True).start()
 
     def toggle_rec(self):
         if not self.worker.is_recording:
